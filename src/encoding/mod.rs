@@ -209,6 +209,254 @@ pub enum BACnetTag {
     Context(u8),
 }
 
+/// Length/value/type marker for a tag with an extended payload length byte.
+pub const EXTENDED_LENGTH_VALUE_TYPE: u8 = 5;
+/// Length/value/type marker for a constructed context opening tag.
+pub const OPENING_TAG_LENGTH_VALUE_TYPE: u8 = 6;
+/// Length/value/type marker for a constructed context closing tag.
+pub const CLOSING_TAG_LENGTH_VALUE_TYPE: u8 = 7;
+/// Inline tag number reserved for extended tag-number encoding.
+pub const EXTENDED_TAG_NUMBER: u8 = 15;
+
+/// Whether a decoded BACnet tag is application or context-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagClass {
+    Application,
+    Context,
+}
+
+/// Decoded metadata for one BACnet application or context-specific tag.
+///
+/// For primitive tags, `payload_length` is `Some(n)` and `header_length`
+/// includes any extended length bytes. For constructed opening/closing tags,
+/// `payload_length` is `None` and the tag consumes exactly `header_length`
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagHeader {
+    pub tag_class: TagClass,
+    pub tag_number: u8,
+    pub length_value_type: u8,
+    pub payload_length: Option<usize>,
+    pub header_length: usize,
+}
+
+impl TagHeader {
+    pub fn is_application(self) -> bool {
+        self.tag_class == TagClass::Application
+    }
+
+    pub fn is_context(self) -> bool {
+        self.tag_class == TagClass::Context
+    }
+
+    pub fn is_opening(self) -> bool {
+        self.is_context() && self.length_value_type == OPENING_TAG_LENGTH_VALUE_TYPE
+    }
+
+    pub fn is_closing(self) -> bool {
+        self.is_context() && self.length_value_type == CLOSING_TAG_LENGTH_VALUE_TYPE
+    }
+
+    pub fn is_constructed(self) -> bool {
+        self.is_opening() || self.is_closing()
+    }
+
+    pub fn is_primitive(self) -> bool {
+        !self.is_constructed()
+    }
+
+    pub fn total_length(self) -> Option<usize> {
+        self.payload_length
+            .map(|payload_length| self.header_length + payload_length)
+    }
+}
+
+/// Decode the next BACnet tag header without consuming its payload.
+///
+/// Extended payload lengths are supported. Extended tag numbers are rejected
+/// for now because the rest of the service layer only handles inline tag
+/// numbers (`0..=14`).
+pub fn decode_tag_header(data: &[u8]) -> Result<TagHeader> {
+    if data.is_empty() {
+        return Err(EncodingError::InvalidTag);
+    }
+
+    let tag_byte = data[0];
+    let tag_number = tag_byte >> 4;
+    if tag_number == EXTENDED_TAG_NUMBER {
+        return Err(EncodingError::InvalidTag);
+    }
+
+    let tag_class = if tag_byte & 0x08 == 0 {
+        TagClass::Application
+    } else {
+        TagClass::Context
+    };
+    let length_value_type = tag_byte & 0x07;
+
+    if tag_class == TagClass::Context
+        && (length_value_type == OPENING_TAG_LENGTH_VALUE_TYPE
+            || length_value_type == CLOSING_TAG_LENGTH_VALUE_TYPE)
+    {
+        return Ok(TagHeader {
+            tag_class,
+            tag_number,
+            length_value_type,
+            payload_length: None,
+            header_length: 1,
+        });
+    }
+
+    let mut payload_length = length_value_type as usize;
+    let mut header_length = 1;
+
+    if length_value_type == EXTENDED_LENGTH_VALUE_TYPE {
+        if data.len() < 2 {
+            return Err(EncodingError::BufferUnderflow);
+        }
+
+        let len_byte = data[1];
+        header_length += 1;
+        match len_byte {
+            0..=253 => {
+                payload_length = len_byte as usize;
+            }
+            254 => {
+                if data.len() < 4 {
+                    return Err(EncodingError::BufferUnderflow);
+                }
+                payload_length = u16::from_be_bytes([data[2], data[3]]) as usize;
+                header_length += 2;
+            }
+            255 => {
+                if data.len() < 6 {
+                    return Err(EncodingError::BufferUnderflow);
+                }
+                payload_length = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+                header_length += 4;
+            }
+        }
+    }
+
+    Ok(TagHeader {
+        tag_class,
+        tag_number,
+        length_value_type,
+        payload_length: Some(payload_length),
+        header_length,
+    })
+}
+
+/// Decode the next context-specific primitive tag and return its borrowed
+/// payload bytes.
+pub fn decode_context_primitive(data: &[u8]) -> Result<(u8, &[u8], usize)> {
+    let header = decode_tag_header(data)?;
+    if !header.is_context() || !header.is_primitive() {
+        return Err(EncodingError::InvalidTag);
+    }
+
+    let payload_length = header.payload_length.ok_or(EncodingError::InvalidTag)?;
+    let total_length = header.header_length + payload_length;
+    if data.len() < total_length {
+        return Err(EncodingError::BufferUnderflow);
+    }
+
+    Ok((
+        header.tag_number,
+        &data[header.header_length..total_length],
+        total_length,
+    ))
+}
+
+/// Decode a constructed context block and return the bytes inside the matching
+/// opening and closing tags, plus the total bytes consumed.
+pub fn extract_context_block(data: &[u8], expected_tag: u8) -> Result<(&[u8], usize)> {
+    let opening = decode_tag_header(data)?;
+    if !opening.is_opening() || opening.tag_number != expected_tag {
+        return Err(EncodingError::InvalidTag);
+    }
+
+    let mut stack = Vec::new();
+    stack.push(opening.tag_number);
+    let mut cursor = opening.header_length;
+
+    while cursor < data.len() {
+        let header = decode_tag_header(&data[cursor..])?;
+        if header.is_opening() {
+            stack.push(header.tag_number);
+            cursor += header.header_length;
+            continue;
+        }
+
+        if header.is_closing() {
+            let Some(open_tag) = stack.pop() else {
+                return Err(EncodingError::InvalidTag);
+            };
+            if open_tag != header.tag_number {
+                return Err(EncodingError::InvalidTag);
+            }
+            cursor += header.header_length;
+            if stack.is_empty() {
+                return Ok((
+                    &data[opening.header_length..cursor - header.header_length],
+                    cursor,
+                ));
+            }
+            continue;
+        }
+
+        cursor += header.total_length().ok_or(EncodingError::InvalidTag)?;
+    }
+
+    Err(EncodingError::UnexpectedEndOfData)
+}
+
+/// Return the number of bytes occupied by the next complete BACnet value.
+///
+/// Primitive values consume their tag header plus payload. Constructed context
+/// values consume the opening tag, all nested content, and the matching closing
+/// tag.
+pub fn skip_value(data: &[u8]) -> Result<usize> {
+    let header = decode_tag_header(data)?;
+    if header.is_opening() {
+        let (_, consumed) = extract_context_block(data, header.tag_number)?;
+        Ok(consumed)
+    } else if header.is_closing() {
+        Ok(header.header_length)
+    } else {
+        let total_length = header.total_length().ok_or(EncodingError::InvalidTag)?;
+        if data.len() < total_length {
+            return Err(EncodingError::BufferUnderflow);
+        }
+        Ok(total_length)
+    }
+}
+
+/// Convert a big-endian unsigned integer payload into a `u64`.
+pub fn bytes_to_unsigned(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() > 8 {
+        return Err(EncodingError::InvalidLength);
+    }
+
+    let mut value = 0u64;
+    for &byte in bytes {
+        value = (value << 8) | u64::from(byte);
+    }
+    Ok(value)
+}
+
+/// Convert a big-endian two's-complement signed integer payload into an `i64`.
+pub fn bytes_to_signed(bytes: &[u8]) -> Result<i64> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return Err(EncodingError::InvalidLength);
+    }
+
+    let sign_extend = if bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 };
+    let mut full = [sign_extend; 8];
+    full[8 - bytes.len()..].copy_from_slice(bytes);
+    Ok(i64::from_be_bytes(full))
+}
+
 pub fn decode_tag(data: &[u8]) -> Result<(BACnetTag, usize, usize)> {
     if data.is_empty() {
         return Err(EncodingError::InvalidTag);
@@ -1044,6 +1292,140 @@ pub fn decode_context_object_id(
     ]);
 
     Ok((object_id.into(), tag_consumed + 4))
+}
+
+/// Encode a context-specific unsigned integer that may require up to 64 bits.
+pub fn encode_context_unsigned64(value: u64, tag_number: u8) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let bytes = minimal_unsigned_bytes(value);
+    encode_context_tag(&mut buffer, tag_number, bytes.len())?;
+    buffer.extend_from_slice(&bytes);
+    Ok(buffer)
+}
+
+/// Decode a context-specific unsigned integer into a `u64`.
+pub fn decode_context_unsigned64(data: &[u8], expected_tag: u8) -> Result<(u64, usize)> {
+    let (tag_number, payload, consumed) = decode_context_primitive(data)?;
+    if tag_number != expected_tag {
+        return Err(EncodingError::InvalidTag);
+    }
+    Ok((bytes_to_unsigned(payload)?, consumed))
+}
+
+/// Encode a context-specific signed integer using the minimal two's-complement
+/// byte width required by BACnet.
+pub fn encode_context_signed(value: i64, tag_number: u8) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let bytes = minimal_signed_bytes(value);
+    encode_context_tag(&mut buffer, tag_number, bytes.len())?;
+    buffer.extend_from_slice(&bytes);
+    Ok(buffer)
+}
+
+/// Decode a context-specific signed integer into an `i64`.
+pub fn decode_context_signed(data: &[u8], expected_tag: u8) -> Result<(i64, usize)> {
+    let (tag_number, payload, consumed) = decode_context_primitive(data)?;
+    if tag_number != expected_tag {
+        return Err(EncodingError::InvalidTag);
+    }
+    Ok((bytes_to_signed(payload)?, consumed))
+}
+
+/// Encode a context-specific boolean using the standard tag-value form where
+/// the value is carried in the length/value/type field and no payload follows.
+pub fn encode_context_boolean(value: bool, tag_number: u8) -> Result<Vec<u8>> {
+    if tag_number > 14 {
+        return Err(EncodingError::ValueOutOfRange);
+    }
+    Ok(vec![0x08 | (tag_number << 4) | u8::from(value)])
+}
+
+/// Encode a context-specific boolean using an explicit one-byte payload.
+///
+/// Some deployed BACnet devices expect this form for services such as
+/// SubscribeCOV even though the compact tag-value form is standard.
+pub fn encode_context_boolean_explicit(value: bool, tag_number: u8) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    encode_context_tag(&mut buffer, tag_number, 1)?;
+    buffer.push(u8::from(value));
+    Ok(buffer)
+}
+
+/// Decode a context-specific boolean encoded with an explicit one-byte payload.
+pub fn decode_context_boolean_explicit(data: &[u8], expected_tag: u8) -> Result<(bool, usize)> {
+    let (tag_number, payload, consumed) = decode_context_primitive(data)?;
+    if tag_number != expected_tag || payload.len() != 1 {
+        return Err(EncodingError::InvalidTag);
+    }
+    match payload[0] {
+        0 => Ok((false, consumed)),
+        1 => Ok((true, consumed)),
+        _ => Err(EncodingError::InvalidFormat(
+            "context boolean payload must be 0 or 1".to_string(),
+        )),
+    }
+}
+
+/// Encode a constructed context value by writing opening and closing tags
+/// around the bytes produced by `encode_inner`.
+pub fn encode_constructed_context<F>(
+    buffer: &mut Vec<u8>,
+    tag_number: u8,
+    encode_inner: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut Vec<u8>) -> Result<()>,
+{
+    encode_opening_tag(buffer, tag_number)?;
+    encode_inner(buffer)?;
+    encode_closing_tag(buffer, tag_number)?;
+    Ok(())
+}
+
+/// Encode a constructed context opening tag.
+pub fn encode_opening_tag(buffer: &mut Vec<u8>, tag_number: u8) -> Result<()> {
+    if tag_number > 14 {
+        return Err(EncodingError::ValueOutOfRange);
+    }
+    buffer.push(OPENING_TAG_LENGTH_VALUE_TYPE | (tag_number << 4) | 0x08);
+    Ok(())
+}
+
+/// Encode a constructed context closing tag.
+pub fn encode_closing_tag(buffer: &mut Vec<u8>, tag_number: u8) -> Result<()> {
+    if tag_number > 14 {
+        return Err(EncodingError::ValueOutOfRange);
+    }
+    buffer.push(CLOSING_TAG_LENGTH_VALUE_TYPE | (tag_number << 4) | 0x08);
+    Ok(())
+}
+
+fn minimal_unsigned_bytes(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    bytes[first_non_zero..].to_vec()
+}
+
+fn minimal_signed_bytes(value: i64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut start = 0usize;
+
+    while start < bytes.len() - 1 {
+        let current = bytes[start];
+        let next = bytes[start + 1];
+        let redundant_positive = current == 0x00 && next & 0x80 == 0;
+        let redundant_negative = current == 0xFF && next & 0x80 != 0;
+        if redundant_positive || redundant_negative {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+
+    bytes[start..].to_vec()
 }
 
 impl TryFrom<u8> for ApplicationTag {
@@ -2620,5 +3002,141 @@ mod tests {
         assert_eq!(tag, BACnetTag::Application(ApplicationTag::SignedInt));
         assert_eq!(length, 8);
         assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn test_decode_tag_header_distinguishes_constructed_context_tags() {
+        let opening = decode_tag_header(&[0x3E]).unwrap();
+        assert_eq!(opening.tag_class, TagClass::Context);
+        assert_eq!(opening.tag_number, 3);
+        assert!(opening.is_opening());
+        assert_eq!(opening.payload_length, None);
+        assert_eq!(opening.header_length, 1);
+
+        let closing = decode_tag_header(&[0x3F]).unwrap();
+        assert!(closing.is_closing());
+
+        let primitive = decode_tag_header(&[0x29, 0x2A]).unwrap();
+        assert_eq!(primitive.tag_class, TagClass::Context);
+        assert_eq!(primitive.tag_number, 2);
+        assert!(primitive.is_primitive());
+        assert_eq!(primitive.payload_length, Some(1));
+        assert_eq!(primitive.total_length(), Some(2));
+    }
+
+    #[test]
+    fn test_decode_context_primitive_borrows_payload() {
+        let data = [0x2A, 0x12, 0x34, 0xFF];
+
+        let (tag, payload, consumed) = decode_context_primitive(&data).unwrap();
+
+        assert_eq!(tag, 2);
+        assert_eq!(payload, &[0x12, 0x34]);
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn test_extract_context_block_handles_nested_constructed_values() {
+        let data = [
+            0x3E, // opening [3]
+            0x09, 0x01, // [0] unsigned 1
+            0x4E, // opening [4]
+            0x19, 0x02, // [1] unsigned 2
+            0x4F, // closing [4]
+            0x3F, // closing [3]
+            0xFF,
+        ];
+
+        let (inner, consumed) = extract_context_block(&data, 3).unwrap();
+
+        assert_eq!(inner, &[0x09, 0x01, 0x4E, 0x19, 0x02, 0x4F]);
+        assert_eq!(consumed, 8);
+    }
+
+    #[test]
+    fn test_extract_context_block_rejects_mismatched_closing_tag() {
+        let data = [
+            0x3E, // opening [3]
+            0x4F, // closing [4]
+        ];
+
+        assert!(matches!(
+            extract_context_block(&data, 3),
+            Err(EncodingError::InvalidTag)
+        ));
+    }
+
+    #[test]
+    fn test_skip_value_skips_constructed_block() {
+        let data = [
+            0x3E, // opening [3]
+            0x09, 0x01, // [0] unsigned 1
+            0x3F, // closing [3]
+            0x21, 0x2A, // application unsigned 42
+        ];
+
+        assert_eq!(skip_value(&data).unwrap(), 4);
+        assert_eq!(skip_value(&data[4..]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_context_signed_round_trips_minimal_widths() {
+        let values = [
+            0,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            -129,
+            i32::MAX as i64 + 1,
+            i64::MIN,
+            i64::MAX,
+        ];
+
+        for value in values {
+            let encoded = encode_context_signed(value, 1).unwrap();
+            let (decoded, consumed) = decode_context_signed(&encoded, 1).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_context_unsigned64_round_trips_large_values() {
+        let values = [0, 1, 255, 256, u32::MAX as u64 + 1, u64::MAX];
+
+        for value in values {
+            let encoded = encode_context_unsigned64(value, 2).unwrap();
+            let (decoded, consumed) = decode_context_unsigned64(&encoded, 2).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_context_boolean_encoders() {
+        assert_eq!(encode_context_boolean(false, 2).unwrap(), vec![0x28]);
+        assert_eq!(encode_context_boolean(true, 2).unwrap(), vec![0x29]);
+
+        let explicit = encode_context_boolean_explicit(true, 2).unwrap();
+        assert_eq!(explicit, vec![0x29, 0x01]);
+        assert_eq!(
+            decode_context_boolean_explicit(&explicit, 2).unwrap(),
+            (true, 2)
+        );
+    }
+
+    #[test]
+    fn test_encode_constructed_context_wraps_inner_bytes() {
+        let mut buffer = Vec::new();
+
+        encode_constructed_context(&mut buffer, 3, |buffer| {
+            buffer.extend_from_slice(&encode_context_unsigned(7, 0)?);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(buffer, vec![0x3E, 0x09, 0x07, 0x3F]);
     }
 }
