@@ -405,7 +405,7 @@ pub fn extract_context_block(data: &[u8], expected_tag: u8) -> Result<(&[u8], us
             continue;
         }
 
-        cursor += header.total_length().ok_or(EncodingError::InvalidTag)?;
+        cursor += primitive_total_length(header, &data[cursor..])?;
     }
 
     Err(EncodingError::UnexpectedEndOfData)
@@ -424,12 +424,25 @@ pub fn skip_value(data: &[u8]) -> Result<usize> {
     } else if header.is_closing() {
         Ok(header.header_length)
     } else {
-        let total_length = header.total_length().ok_or(EncodingError::InvalidTag)?;
-        if data.len() < total_length {
-            return Err(EncodingError::BufferUnderflow);
-        }
-        Ok(total_length)
+        primitive_total_length(header, data)
     }
+}
+
+fn primitive_total_length(header: TagHeader, data: &[u8]) -> Result<usize> {
+    if header.is_application()
+        && matches!(
+            header.tag_number,
+            tag if tag == ApplicationTag::Null as u8 || tag == ApplicationTag::Boolean as u8
+        )
+    {
+        return Ok(header.header_length);
+    }
+
+    let total_length = header.total_length().ok_or(EncodingError::InvalidTag)?;
+    if data.len() < total_length {
+        return Err(EncodingError::BufferUnderflow);
+    }
+    Ok(total_length)
 }
 
 /// Convert a big-endian unsigned integer payload into a `u64`.
@@ -3054,6 +3067,22 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_context_block_handles_application_boolean_values() {
+        let data = [
+            0x4E, // opening [4]
+            0x11, // application Boolean true; no payload bytes
+            0x21, 0x2A, // application Unsigned 42
+            0x4F, // closing [4]
+            0xFF,
+        ];
+
+        let (inner, consumed) = extract_context_block(&data, 4).unwrap();
+
+        assert_eq!(inner, &[0x11, 0x21, 0x2A]);
+        assert_eq!(consumed, 5);
+    }
+
+    #[test]
     fn test_extract_context_block_rejects_mismatched_closing_tag() {
         let data = [
             0x3E, // opening [3]
@@ -3077,6 +3106,13 @@ mod tests {
 
         assert_eq!(skip_value(&data).unwrap(), 4);
         assert_eq!(skip_value(&data[4..]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_skip_value_treats_application_null_and_boolean_as_header_only() {
+        assert_eq!(skip_value(&[0x00, 0xFF]).unwrap(), 1);
+        assert_eq!(skip_value(&[0x10, 0xFF]).unwrap(), 1);
+        assert_eq!(skip_value(&[0x11, 0xFF]).unwrap(), 1);
     }
 
     #[test]
