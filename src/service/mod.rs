@@ -2030,6 +2030,11 @@ impl UtcTimeSynchronizationRequest {
     }
 }
 
+pub mod read_range;
+pub use read_range::{
+    LogDatum, LogRecord, ReadRangeBy, ReadRangeRequest, ReadRangeResponse, ResultFlags,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
