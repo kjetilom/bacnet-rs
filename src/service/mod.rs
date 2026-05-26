@@ -1254,27 +1254,36 @@ impl SubscribeCovRequest {
         }
     }
 
-    /// Encode the Subscribe COV request
+    /// Encode the Subscribe COV request.
+    ///
+    /// Omitting both `issue_confirmed_notifications` and `lifetime` produces the
+    /// BACnet cancel form (only [0] and [1] are present).
     pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
-        // Subscriber process identifier - context tag 0
-        buffer.push(0x09); // Context tag 0, length 1
-        buffer.push(self.subscriber_process_identifier as u8);
+        use crate::encoding::{
+            encode_context_boolean_explicit, encode_context_object_id, encode_context_unsigned,
+        };
 
-        // Monitored object identifier - context tag 1
-        let object_id: u32 = self.monitored_object_identifier.try_into()?;
-        buffer.push(0x1C); // Context tag 1, length 4
-        buffer.extend_from_slice(&object_id.to_be_bytes());
+        // [0] subscriberProcessIdentifier
+        buffer.extend_from_slice(&encode_context_unsigned(
+            self.subscriber_process_identifier,
+            0,
+        )?);
 
-        // Issue confirmed notifications - context tag 2 (optional)
+        // [1] monitoredObjectIdentifier
+        buffer.extend_from_slice(&encode_context_object_id(
+            self.monitored_object_identifier,
+            1,
+        )?);
+
+        // [2] issueConfirmedNotifications (optional, explicit-length boolean
+        //     form expected by many real devices)
         if let Some(confirmed) = self.issue_confirmed_notifications {
-            buffer.push(0x22); // Context tag 2, length 2
-            buffer.push(if confirmed { 1 } else { 0 });
+            buffer.extend_from_slice(&encode_context_boolean_explicit(confirmed, 2)?);
         }
 
-        // Lifetime - context tag 3 (optional)
+        // [3] lifetime (optional)
         if let Some(lifetime) = self.lifetime {
-            buffer.push(0x39); // Context tag 3, length 1
-            buffer.push(lifetime as u8);
+            buffer.extend_from_slice(&encode_context_unsigned(lifetime, 3)?);
         }
 
         Ok(())
@@ -2030,7 +2039,9 @@ impl UtcTimeSynchronizationRequest {
     }
 }
 
+pub mod cov;
 pub mod read_range;
+pub use cov::{CovNotification, CovPropertyValue};
 pub use read_range::{
     LogDatum, LogRecord, ReadRangeBy, ReadRangeRequest, ReadRangeResponse, ResultFlags,
 };
