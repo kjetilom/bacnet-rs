@@ -382,6 +382,31 @@ generate_custom_enum!(
     ApduTooLong = 11,
 }, u8, 64..=255);
 
+impl From<u8> for AbortReason {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::BufferOverflow,
+            2 => Self::InvalidApduInThisState,
+            3 => Self::PreemptedByHigherPriorityTask,
+            4 => Self::SegmentationNotSupported,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl fmt::Display for AbortReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Other => "Other",
+            Self::BufferOverflow => "BufferOverflow",
+            Self::InvalidApduInThisState => "InvalidApduInThisState",
+            Self::PreemptedByHigherPriorityTask => "PreemptedByHigherPriorityTask",
+            Self::SegmentationNotSupported => "SegmentationNotSupported",
+        };
+        write!(f, "{name}")
+    }
+}
+
 use crate::encoding::{
     decode_context_enumerated, decode_context_object_id, decode_context_tag,
     decode_context_unsigned, decode_enumerated, decode_object_identifier, decode_tag,
