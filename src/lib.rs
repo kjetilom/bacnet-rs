@@ -131,6 +131,9 @@ pub mod client;
 /// Property value decoders for various BACnet data types
 pub mod property;
 
+/// Typed BACnet constructed datatypes (schedules, calendars, recipients)
+pub mod datatypes;
+
 // Re-export main types for convenient access
 pub use datalink::{DataLink, DataLinkAddress, DataLinkType};
 pub use encoding::{ApplicationTag, EncodingError};
