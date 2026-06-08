@@ -2064,9 +2064,16 @@ impl UtcTimeSynchronizationRequest {
     }
 }
 
+pub mod acknowledge_alarm;
 pub mod cov;
+pub mod event_information;
 pub mod read_range;
+pub use acknowledge_alarm::AcknowledgeAlarmRequest;
 pub use cov::{CovNotification, CovPropertyValue};
+pub use event_information::{
+    BacnetTimeStamp, EventSummary, EventTransitionBits, GetEventInformationRequest,
+    GetEventInformationResponse,
+};
 pub use read_range::{
     LogDatum, LogRecord, ReadRangeBy, ReadRangeRequest, ReadRangeResponse, ResultFlags,
 };
