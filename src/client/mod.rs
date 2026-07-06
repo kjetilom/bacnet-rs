@@ -577,11 +577,10 @@ impl BacnetClient {
 
     /// Build a BACnet/IP frame for an unconfirmed request.
     ///
-    /// `broadcast` selects the frame shape as a pair, matching the reference
-    /// bacnet-stack (and YABE): a broadcast carries a global-broadcast NPDU
+    /// `broadcast` selects the frame shape as a pair, matching YABE: a broadcast carries a global-broadcast NPDU
+    ///
     /// (DNET `0xFFFF`, hop count 255) inside an Original-Broadcast-NPDU BVLC,
     /// while a unicast carries a plain local NPDU inside Original-Unicast-NPDU.
-    /// Mixing the two confuses some stacks (see issue #58).
     fn create_unconfirmed_frame(
         &self,
         service_choice: u8,
@@ -1000,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_whois_frame_matches_reference_stack() {
-        // The frame YABE and the reference bacnet-stack send for a global
+        // The frame YABE sends for a global
         // Who-Is (issue #58): Original-Broadcast-NPDU BVLC around an NPDU
         // with DNET 0xFFFF, DLEN 0, hop count 255.
         let client = test_client();
