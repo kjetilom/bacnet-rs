@@ -221,6 +221,11 @@ impl BacnetClient {
     /// This is the explicit-target form of [`who_is`](Self::who_is); use it for
     /// subnet-directed broadcasts (e.g. `192.168.1.255:47808`) or to query a
     /// BBMD/foreign-device peer directly.
+    ///
+    /// Broadcast targets (the limited broadcast `255.255.255.255` or a local
+    /// interface's subnet broadcast) are sent as a global-broadcast NPDU in an
+    /// Original-Broadcast-NPDU BVLC, matching the reference bacnet-stack;
+    /// anything else is sent as a plain unicast frame.
     pub fn who_is_to(
         &self,
         target_addr: SocketAddr,
@@ -237,10 +242,10 @@ impl BacnetClient {
         let mut buffer = Vec::new();
         whois.encode(&mut buffer)?;
 
-        let message = self.create_unconfirmed_bvlc(
+        let message = self.create_unconfirmed_frame(
             UnconfirmedServiceChoice::WhoIs as u8,
             &buffer,
-            BVLC_ORIGINAL_BROADCAST,
+            is_broadcast_target(target_addr),
         );
         self.socket.send_to(&message, target_addr)?;
 
@@ -567,21 +572,29 @@ impl BacnetClient {
 
     /// Create an unconfirmed message
     fn create_unconfirmed_message(&self, service_choice: u8, service_data: &[u8]) -> Vec<u8> {
-        self.create_unconfirmed_bvlc(service_choice, service_data, BVLC_ORIGINAL_UNICAST)
+        self.create_unconfirmed_frame(service_choice, service_data, false)
     }
 
-    /// Build a BACnet/IP frame for an unconfirmed request, wrapped with the
-    /// given BVLC function (`0x0A` unicast or `0x0B` broadcast).
-    fn create_unconfirmed_bvlc(
+    /// Build a BACnet/IP frame for an unconfirmed request.
+    ///
+    /// `broadcast` selects the frame shape as a pair, matching YABE: a broadcast carries a global-broadcast NPDU
+    ///
+    /// (DNET `0xFFFF`, hop count 255) inside an Original-Broadcast-NPDU BVLC,
+    /// while a unicast carries a plain local NPDU inside Original-Unicast-NPDU.
+    fn create_unconfirmed_frame(
         &self,
         service_choice: u8,
         service_data: &[u8],
-        bvlc_function: u8,
+        broadcast: bool,
     ) -> Vec<u8> {
-        // Create NPDU
-        let mut npdu = Npdu::new();
-        npdu.control.expecting_reply = false;
-        npdu.control.priority = 0;
+        let (npdu, bvlc_function) = if broadcast {
+            (Npdu::global_broadcast(), BVLC_ORIGINAL_BROADCAST)
+        } else {
+            let mut npdu = Npdu::new();
+            npdu.control.expecting_reply = false;
+            npdu.control.priority = 0;
+            (npdu, BVLC_ORIGINAL_UNICAST)
+        };
         let npdu_buffer = npdu.encode();
 
         // Create unconfirmed service request APDU
@@ -891,6 +904,30 @@ fn values_equivalent(written: &PropertyValue, read_back: &PropertyValue) -> bool
     }
 }
 
+/// Whether a Who-Is target should be framed as a broadcast.
+///
+/// True for the IPv4 limited broadcast (`255.255.255.255`) and for the
+/// subnet-directed broadcast address of any local interface. A directed
+/// broadcast for a *remote* subnet can't be recognized without that subnet's
+/// mask, so it falls back to unicast framing; IPv6 has no broadcast at all.
+#[cfg(feature = "std")]
+fn is_broadcast_target(addr: SocketAddr) -> bool {
+    let std::net::IpAddr::V4(ip) = addr.ip() else {
+        return false;
+    };
+    if ip.is_broadcast() {
+        return true;
+    }
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces.iter().any(|iface| match &iface.addr {
+                if_addrs::IfAddr::V4(v4) => v4.broadcast == Some(ip),
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,6 +986,59 @@ mod tests {
     fn test_new_uses_defaults() {
         let client = BacnetClient::new().expect("client should bind");
         assert_eq!(client.timeout(), DEFAULT_TIMEOUT);
+    }
+
+    /// Loopback-bound client for frame-construction tests.
+    fn test_client() -> BacnetClient {
+        BacnetClient::builder()
+            .local_addr("127.0.0.1")
+            .port(0)
+            .build()
+            .expect("client should bind")
+    }
+
+    #[test]
+    fn test_broadcast_whois_frame_matches_reference_stack() {
+        // The frame YABE sends for a global
+        // Who-Is (issue #58): Original-Broadcast-NPDU BVLC around an NPDU
+        // with DNET 0xFFFF, DLEN 0, hop count 255.
+        let client = test_client();
+        let frame =
+            client.create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &[], true);
+        assert_eq!(
+            frame,
+            [
+                0x81, 0x0B, 0x00, 0x0C, // BVLC: Original-Broadcast-NPDU, length 12
+                0x01, 0x20, 0xFF, 0xFF, 0x00, 0xFF, // NPDU: dest DNET 0xFFFF, hop 255
+                0x10, 0x08, // APDU: Unconfirmed-Request, Who-Is
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unicast_whois_frame_uses_local_npdu() {
+        let client = test_client();
+        let frame =
+            client.create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &[], false);
+        assert_eq!(
+            frame,
+            [
+                0x81, 0x0A, 0x00, 0x08, // BVLC: Original-Unicast-NPDU, length 8
+                0x01, 0x00, // NPDU: no destination
+                0x10, 0x08, // APDU: Unconfirmed-Request, Who-Is
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_broadcast_target() {
+        assert!(is_broadcast_target(
+            "255.255.255.255:47808".parse().unwrap()
+        ));
+        assert!(!is_broadcast_target("127.0.0.1:47808".parse().unwrap()));
+        assert!(!is_broadcast_target("10.161.1.211:47808".parse().unwrap()));
+        // IPv6 has no broadcast.
+        assert!(!is_broadcast_target("[::1]:47808".parse().unwrap()));
     }
 
     #[test]
